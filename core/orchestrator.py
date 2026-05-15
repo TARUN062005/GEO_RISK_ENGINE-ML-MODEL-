@@ -511,6 +511,7 @@ async def analyze_multi_mode_v5(
     from core.routing.air import generate_air_route
     from core.routing.sea import generate_sea_route
     from core.routing.road import generate_road_route
+    from core.routing.cache import get_or_generate_route
     from core.geo.zones import check_route_zone_intersections, compute_zone_risk
     from storage.repository import get_events_near_route
 
@@ -532,7 +533,12 @@ async def analyze_multi_mode_v5(
     # ── Step 2: Generate routes in PARALLEL (Log10) ──────────────────────
     async def _gen_route(mode_name, gen_fn):
         try:
-            return mode_name, await asyncio.to_thread(gen_fn)
+            route_result = await asyncio.to_thread(gen_fn)
+            logger.info(
+                "[%s] route: %d waypoints, %.0f km",
+                mode_name, len(route_result.waypoints), route_result.total_distance_km,
+            )
+            return mode_name, route_result
         except Exception as exc:
             logger.warning("[%s] route generation failed: %s", mode_name, exc)
             return mode_name, None
