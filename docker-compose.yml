@@ -1,0 +1,86 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: geo-risk-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: geo-risk-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: geo_risk
+      MONGO_COLLECTION: geo_events
+    ports:
+      - "8000:8000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build: .
+    container_name: geo-risk-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: geo_risk
+      MONGO_COLLECTION: geo_events
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command: ["python", "-m", "ingestion.realtime_worker", "--interval", "180"]
+
+  redis:
+    image: redis:7-alpine
+    container_name: geo-risk-redis
+    restart: unless-stopped
+    profiles:
+      - cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  analyze:
+    build: .
+    container_name: geo-risk-analyze
+    profiles:
+      - cli
+    env_file:
+      - .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: geo_risk
+      MONGO_COLLECTION: geo_events
+    depends_on:
+      mongo:
+        condition: service_healthy
+    entrypoint: ["python", "run_live.py"]
+    command: ["--origin", "Mumbai, India", "--destination", "Dubai, UAE"]
+
+volumes:
+  mongo_data:
+  redis_data:
