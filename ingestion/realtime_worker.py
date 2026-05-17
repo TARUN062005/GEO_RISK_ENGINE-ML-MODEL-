@@ -1,7 +1,7 @@
 """
 ingestion/realtime_worker.py
 ----------------------------
-Real-Time Continuous Ingestion Worker (Log5)
+Real-Time Continuous Ingestion Worker (Log5, hardened Log15)
 
 Replaces batch-only ingestion with a continuous hybrid system:
   - Fetches from GDELT, RSS feeds, and News APIs
@@ -10,6 +10,13 @@ Replaces batch-only ingestion with a continuous hybrid system:
   - Verifies source credibility before storage
   - Tags events with geo zone matches
   - Stores enriched events with full provenance
+
+Log15: Production hardening.
+  - Quota-aware scheduling (per-source intervals + daily limits)
+  - Source-specific fetch intervals (RSS: 3min, GDELT: 15min, APIs: 30min)
+  - Structured quota/health logging
+  - Feed health monitoring
+  - Graceful skip when quotas exhausted
 
 Does NOT replace ingestion/worker.py — extends it.
 The existing ingest_batch() remains available for manual/cron use.
@@ -99,18 +106,30 @@ def _is_valid_raw_event(ev: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Multi-Source Fetch
+# Multi-Source Fetch — Log15: Quota-Aware
 # ---------------------------------------------------------------------------
 
 async def _fetch_all_sources(max_per_source: int = 50) -> list[dict]:
     """
     Fetch events from all configured sources in parallel.
-    Returns unified event dicts with source metadata.
+
+    Log15: Quota-aware fetching.
+      - Each source checks its own quota before fetching
+      - Sources are skipped gracefully when exhausted
+      - Per-source intervals prevent over-fetching
+      - Structured logging of quota state
     """
+    from ingestion.quota_manager import get_quota_manager
+
+    qm = get_quota_manager()
     results: list[dict] = []
     seen_hashes: set[str] = set()
 
-    # --- 1. GDELT (DOC API — Log11) ---
+    # Log15: Log quota state at start of cycle
+    logger.info("Quota state: %s", qm.status_summary())
+
+    # --- 1. GDELT (DOC API — Log11, hardened Log15) ---
+    # GDELT checks its own quota internally via gdelt.py
     try:
         gdelt_raw = await fetch_gdelt_events(max_events=max_per_source)
         for raw in gdelt_raw:
@@ -138,21 +157,26 @@ async def _fetch_all_sources(max_per_source: int = 50) -> list[dict]:
     except Exception as exc:
         logger.warning("[GDELT] fetch failed (non-fatal): %s", exc)
 
-    # --- 2. RSS Feeds ---
-    try:
-        rss_events = await fetch_rss_events(max_per_feed=max_per_source // 5)
-        for ev in rss_events:
-            url_hash = hashlib.sha256(ev["event_id"].encode()).hexdigest()[:16]
-            if url_hash not in seen_hashes:
-                seen_hashes.add(url_hash)
-                metrics.inc("dedup_cache_misses")
-                results.append(ev)
-            else:
-                metrics.inc("dedup_cache_hits")
-    except Exception as exc:
-        logger.warning("[RSS] fetch failed: %s", exc)
+    # --- 2. RSS Feeds (Log15: with feed health monitoring) ---
+    # RSS has no quota limit — always fetch
+    if qm.can_fetch("rss"):
+        try:
+            rss_events = await fetch_rss_events(max_per_feed=max_per_source // 5)
+            qm.record_request("rss")
+            for ev in rss_events:
+                url_hash = hashlib.sha256(ev["event_id"].encode()).hexdigest()[:16]
+                if url_hash not in seen_hashes:
+                    seen_hashes.add(url_hash)
+                    metrics.inc("dedup_cache_misses")
+                    results.append(ev)
+                else:
+                    metrics.inc("dedup_cache_hits")
+        except Exception as exc:
+            logger.warning("[RSS] fetch failed: %s", exc)
+    else:
+        qm.log_skip("rss")
 
-    # --- 3. News APIs (if keys configured) ---
+    # --- 3. News APIs (Log15: quota-aware — handled internally by newsapi.py) ---
     api_count_before = len(results)
     try:
         api_events = await fetch_news_api_events(max_total=max_per_source)
@@ -176,8 +200,8 @@ async def _fetch_all_sources(max_per_source: int = 50) -> list[dict]:
         source_counts[src] = source_counts.get(src, 0) + 1
 
     logger.info(
-        "Multi-source fetch: %d total events %s",
-        len(results), source_counts,
+        "Multi-source fetch: %d total events %s | Quotas: %s",
+        len(results), source_counts, qm.status_summary(),
     )
     return results
 
@@ -265,7 +289,7 @@ async def ingest_cycle(mongo_collection) -> dict:
     Run one full ingestion cycle across all sources.
 
     Log11: Batch processing pipeline:
-      1. Fetch all sources
+      1. Fetch all sources (quota-aware — Log15)
       2. Verify sources
       3. Pre-filter (cheap regex) — reject irrelevant before ML
       4. Batch ML inference (one forward pass)
@@ -407,10 +431,21 @@ async def ingest_cycle(mongo_collection) -> dict:
     elapsed = _time.time() - t0
     metrics.record_timing("ingestion_cycle_seconds", elapsed)
     metrics.log_cycle_stats(stats)
+
+    # Log15: Log quota state after cycle
+    try:
+        from ingestion.quota_manager import get_quota_manager
+        qm = get_quota_manager()
+        quota_summary = qm.status_summary()
+    except Exception:
+        quota_summary = "unavailable"
+
     logger.info(
-        "Ingestion cycle complete: fetched=%d enriched=%d clustered=%d→%d written=%d skipped=%d errors=%d (%.1fs)",
+        "Ingestion cycle complete: fetched=%d enriched=%d clustered=%d→%d "
+        "written=%d skipped=%d errors=%d (%.1fs) | Quotas: %s",
         stats["fetched"], stats["enriched"], pre_cluster, post_cluster,
         stats["written"], stats["skipped"], stats["errors"], elapsed,
+        quota_summary,
     )
     return stats
 
@@ -435,6 +470,10 @@ async def run_continuous(
 
     validate_environment()
 
+    # Log15: Initialize quota manager at startup
+    from ingestion.quota_manager import get_quota_manager
+    qm = get_quota_manager()
+
     client = AsyncIOMotorClient(MONGO_URI)
     collection = client[MONGO_DB][MONGO_COLLECTION]
 
@@ -442,8 +481,9 @@ async def run_continuous(
     await _ensure_indexes(collection)
 
     logger.info(
-        "Real-time ingestion worker started (interval=%ds, mongo=%s/%s)",
+        "Real-time ingestion worker started (interval=%ds, mongo=%s/%s) | Quotas: %s",
         interval_seconds, redact_secret(MONGO_URI), MONGO_DB,
+        qm.status_summary(),
     )
 
     cycle_count = 0

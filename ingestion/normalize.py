@@ -1,7 +1,7 @@
 """
 ingestion/normalize.py
 ----------------------
-Coordinate Resolver (Log3, updated Log10)
+Coordinate Resolver (Log3, updated Log10, hardened Log15)
 
 Resolves (lon, lat) from:
   1. Feed-supplied coordinates (fastest)
@@ -11,6 +11,12 @@ Resolves (lon, lat) from:
 
 Log10: Added in-memory geocode cache to avoid repeated Nominatim
        lookups for common locations like 'Ukraine', 'Iran', 'Gaza'.
+
+Log15: Entity normalization pipeline before geocoding.
+  - Unicode normalization, garbage filtering
+  - Abbreviation expansion (US→United States, etc.)
+  - Quality scoring to reject non-geographic tokens
+  - Structured metrics for geocoding failures
 """
 
 from __future__ import annotations
@@ -42,8 +48,21 @@ def _cached_geocode(name: str) -> Optional[tuple[float, float]]:
 
 
 def _normalize_location_name(name: str) -> str:
-    """Normalize a location name for better cache hit rate."""
-    return name.strip().title()
+    """
+    Normalize a location name for better cache hit rate.
+
+    Log15: Uses entity_normalizer pipeline for robust cleaning.
+    Falls back to simple title-case if normalizer unavailable.
+    """
+    try:
+        from ingestion.entity_normalizer import normalize_entity
+        result = normalize_entity(name)
+        if result is not None:
+            return result
+        # If normalizer rejects the entity, return empty to skip
+        return ""
+    except ImportError:
+        return name.strip().title()
 
 
 def resolve_coordinates(
@@ -58,7 +77,7 @@ def resolve_coordinates(
     Priority:
       1. Feed-supplied lat/lon (GDELT ActionGeo fields)
       2. Semantic geo tagger — zone keyword matching (Log7)
-      3. LRU-cached NER location → Nominatim geocode (Log10)
+      3. Log15: Normalized NER location → LRU-cached Nominatim geocode
       4. None (event dropped from ingestion)
     """
     # 1. Feed coordinates
@@ -78,11 +97,22 @@ def resolve_coordinates(
     except Exception as exc:
         logger.debug("Geo tagger error: %s", exc)
 
-    # 3. Geocode first NER location (Log10: LRU-cached)
-    for name in location_names[:3]:
+    # 3. Log15: Normalize entities before geocoding
+    try:
+        from ingestion.entity_normalizer import normalize_entities
+        normalized_names = normalize_entities(location_names[:5])
+    except ImportError:
+        normalized_names = location_names[:3]
+
+    geocode_attempts = 0
+    geocode_failures = 0
+
+    for name in normalized_names[:3]:
         normalized = _normalize_location_name(name)
         if not normalized or len(normalized) < 2:
             continue
+
+        geocode_attempts += 1
         before = _cached_geocode.cache_info()
         result = _cached_geocode(normalized)
         try:
@@ -90,8 +120,26 @@ def resolve_coordinates(
             metrics.log_cache_info("geocode", before, _cached_geocode.cache_info())
         except Exception:
             pass
+
         if result is not None:
             logger.debug("Resolved '%s' → (%.4f, %.4f) [cached]", normalized, result[1], result[0])
             return result
+        else:
+            geocode_failures += 1
+
+    # Log15: Track geocoding failure metrics
+    if geocode_attempts > 0:
+        try:
+            from core import metrics
+            metrics.inc("geocode_failures", geocode_failures)
+            metrics.inc("geocode_attempts", geocode_attempts)
+        except Exception:
+            pass
+
+    if geocode_attempts > 0:
+        logger.debug(
+            "Geocoding failed for all %d normalized entities (from %d raw): %s",
+            geocode_attempts, len(location_names), normalized_names[:3],
+        )
 
     return None

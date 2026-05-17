@@ -1,10 +1,13 @@
 """
 config/settings.py
 ------------------
-Centralized Configuration (Log7, updated Log10)
+Centralized Configuration (Log7, updated Log10, extended Log15)
 
 Loads settings from environment variables with safe defaults.
 Supports .env files if python-dotenv is installed.
+
+Log15: Added quota-aware scheduling, rate limiting, and
+       entity normalization configuration.
 """
 
 from __future__ import annotations
@@ -44,6 +47,30 @@ GNEWS_KEY:   str = os.environ.get("GNEWS_KEY", "")
 INGEST_INTERVAL_SECONDS: int = int(os.environ.get("INGEST_INTERVAL_SECONDS", "180"))
 MAX_EVENT_AGE_HOURS:     int = int(os.environ.get("MAX_EVENT_AGE_HOURS", "72"))
 MAX_FRESHNESS_MINUTES:   int = int(os.environ.get("MAX_FRESHNESS_MINUTES", "10"))
+
+# ---------------------------------------------------------------------------
+# Log15: Quota-Aware Scheduling
+# ---------------------------------------------------------------------------
+NEWSAPI_DAILY_QUOTA: int = int(os.environ.get("NEWSAPI_DAILY_QUOTA", "50"))
+GNEWS_DAILY_QUOTA:   int = int(os.environ.get("GNEWS_DAILY_QUOTA", "50"))
+GDELT_DAILY_QUOTA:   int = int(os.environ.get("GDELT_DAILY_QUOTA", "500"))
+
+# Log15: Source-specific fetch intervals (seconds)
+RSS_INTERVAL_SECONDS:     int = int(os.environ.get("RSS_INTERVAL_SECONDS", "180"))
+GDELT_INTERVAL_SECONDS:   int = int(os.environ.get("GDELT_INTERVAL_SECONDS", "900"))
+NEWSAPI_INTERVAL_SECONDS: int = int(os.environ.get("NEWSAPI_INTERVAL_SECONDS", "1800"))
+GNEWS_INTERVAL_SECONDS:   int = int(os.environ.get("GNEWS_INTERVAL_SECONDS", "1800"))
+
+# Log15: Quota exhaustion cooldown (seconds)
+QUOTA_EXHAUSTION_COOLDOWN: int = int(os.environ.get("QUOTA_EXHAUSTION_COOLDOWN", "3600"))
+
+# ---------------------------------------------------------------------------
+# Log15: GDELT Rate Limiting
+# ---------------------------------------------------------------------------
+GDELT_MAX_RETRIES:          int   = int(os.environ.get("GDELT_MAX_RETRIES", "5"))
+GDELT_BASE_BACKOFF:         float = float(os.environ.get("GDELT_BASE_BACKOFF", "3.0"))
+GDELT_MAX_BACKOFF:          float = float(os.environ.get("GDELT_MAX_BACKOFF", "120.0"))
+GDELT_COOLDOWN_DURATION:    float = float(os.environ.get("GDELT_COOLDOWN_DURATION", "600.0"))
 
 # ---------------------------------------------------------------------------
 # Analysis
@@ -101,8 +128,13 @@ def validate_environment() -> None:
     if MAX_REQUEST_BYTES < 1024:
         raise ValueError("MAX_REQUEST_BYTES must be at least 1024")
     logger.info(
-        "Config loaded: mongo=%s newsapi=%s gnews=%s",
+        "Config loaded: mongo=%s newsapi=%s gnews=%s "
+        "quotas=[newsapi=%d/day gnews=%d/day gdelt=%d/day] "
+        "intervals=[rss=%ds gdelt=%ds newsapi=%ds gnews=%ds]",
         MONGO_URI.split("@")[-1],
         "set" if NEWSAPI_KEY else "unset",
         "set" if GNEWS_KEY else "unset",
+        NEWSAPI_DAILY_QUOTA, GNEWS_DAILY_QUOTA, GDELT_DAILY_QUOTA,
+        RSS_INTERVAL_SECONDS, GDELT_INTERVAL_SECONDS,
+        NEWSAPI_INTERVAL_SECONDS, GNEWS_INTERVAL_SECONDS,
     )

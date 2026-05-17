@@ -24,6 +24,9 @@ services:
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB: geo_risk
       MONGO_COLLECTION: geo_events
+      # Log15: API does not need HF models — force offline mode
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
     ports:
       - "8000:8000"
     depends_on:
@@ -47,10 +50,26 @@ services:
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB: geo_risk
       MONGO_COLLECTION: geo_events
+      # Log15: Quota-aware scheduling config
+      NEWSAPI_DAILY_QUOTA: "50"
+      GNEWS_DAILY_QUOTA: "50"
+      GDELT_DAILY_QUOTA: "500"
+      RSS_INTERVAL_SECONDS: "180"
+      GDELT_INTERVAL_SECONDS: "900"
+      NEWSAPI_INTERVAL_SECONDS: "1800"
+      GNEWS_INTERVAL_SECONDS: "1800"
+      # Log15: Pre-cached models available offline
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
     depends_on:
       mongo:
         condition: service_healthy
+    # Log15: Worker runs at base 180s interval; per-source scheduling is handled
+    # internally by QuotaManager (RSS: 3min, GDELT: 15min, APIs: 30min)
     command: ["python", "-m", "ingestion.realtime_worker", "--interval", "180"]
+    volumes:
+      # Log15: Persist quota state across restarts
+      - quota_state:/app/.quota_state
 
   redis:
     image: redis:7-alpine
@@ -84,3 +103,4 @@ services:
 volumes:
   mongo_data:
   redis_data:
+  quota_state:

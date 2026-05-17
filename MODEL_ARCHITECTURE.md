@@ -3288,3 +3288,419 @@ Docker validation could not run locally because Docker is not installed in this 
 
 ---
 <!-- END OF LOG13 - DO NOT REMOVE THIS LINE -->
+
+---
+
+## Log15
+
+**Date:** 2026-05-16
+**Status:** Production Reliability + Quota Efficiency Hardening
+**Scope:** Quota-aware scheduling, GDELT rate limiting, RSS feed hardening, model preloading, Docker optimization, entity normalization, observability
+**References:** Log13 (productionization), Log11 (GDELT DOC API + batch ML), Log10 (caching)
+
+---
+
+### Overview
+
+Log15 addresses six production reliability problems without changing the existing architecture:
+
+| Problem | Root Cause | Solution |
+|---|---|---|
+| API quota overuse | NewsAPI/GNews queried every 180s cycle | Quota-aware scheduler with rolling 24h limits |
+| GDELT 429 errors | Naive retry with fixed delay | Exponential backoff with jitter + cooldown windows |
+| Broken RSS feeds | Reuters DNS failure, AP 403, Maritime Executive 404 | Replaced dead feeds + feed health monitoring |
+| Runtime model downloads | HuggingFace models fetched on first inference | Pre-cached during Docker build phase |
+| Docker image ~3GB | Single-stage build, build-essential in runtime | Multi-stage build, separated build/runtime deps |
+| Geocoding failures | Garbage NER entities sent to Nominatim | Entity normalization pipeline before geocoding |
+
+The worker/API/MongoDB architecture from Log2-Log13 remains unchanged.
+
+---
+
+### Section 1 — Quota-Aware Ingestion Scheduler
+
+**New module:** `ingestion/quota_manager.py`
+
+Implements per-source rolling 24-hour quota management:
+
+| Source | Daily Budget | Fetch Interval | Behavior When Exhausted |
+|---|---|---|---|
+| RSS | Unlimited | 3 min | Always fetched |
+| GDELT | 500 req/day | 15 min | Skip + log cooldown |
+| NewsAPI | 50 req/day | 30 min | Skip + log reset time |
+| GNews | 50 req/day | 30 min | Skip + log reset time |
+
+**Key behaviors:**
+- Rolling 24h window (not midnight reset)
+- Request counters persisted to disk (survives restarts)
+- Automatic cooldown after quota exhaustion
+- Consecutive failure tracking with auto-cooldown
+
+**Expected worker logs:**
+```
+[newsapi] quota used: 12/50
+[gnews] quota exhausted, skipping until reset at 14:30 UTC (50/50 used)
+Quota state: newsapi=12/50(ok) | gnews=50/50(exhausted) | gdelt=8/500(ok) | rss=45/999999(ok)
+```
+
+**API call budget per day:**
+- Previous: ~480 NewsAPI + ~480 GNews (every 3 min × 3 queries × 2 providers)
+- After: ≤50 NewsAPI + ≤50 GNews (quota-capped, single rotated query per cycle)
+
+**Config (env vars):**
+```
+NEWSAPI_DAILY_QUOTA=50
+GNEWS_DAILY_QUOTA=50
+GDELT_DAILY_QUOTA=500
+RSS_INTERVAL_SECONDS=180
+GDELT_INTERVAL_SECONDS=900
+NEWSAPI_INTERVAL_SECONDS=1800
+GNEWS_INTERVAL_SECONDS=1800
+```
+
+---
+
+### Section 2 — GDELT Rate Limit Handling
+
+**New module:** `ingestion/rate_limiter.py`
+**Updated:** `ingestion/gdelt.py`
+
+Production-grade 429 handling:
+
+```
+Attempt 1: request fails with 429
+  → backoff = 3s × 2^0 ± jitter = ~3s
+Attempt 2: request fails with 429
+  → backoff = 3s × 2^1 ± jitter = ~6s
+Attempt 3: request fails with 429
+  → COOLDOWN triggered (3 consecutive 429s)
+  → cooldown for 600s (10 min)
+  → skip GDELT for remaining cycles until cooldown expires
+```
+
+**Features:**
+- Exponential backoff: `base × 2^attempt ± jitter`
+- Jitter factor: ±50% (prevents thundering herd)
+- Max backoff: 120s
+- Max retries: 5
+- Cooldown after 3 consecutive 429s: 10 min
+- Retry-After header support
+- Graceful degradation (returns `[]`, pipeline continues)
+
+**Difference from Log11:**
+Log11 had basic `2^attempt` retry with 3 attempts. Log15 adds jitter, cooldown windows, structured state tracking, and integration with the quota manager.
+
+---
+
+### Section 3 — RSS Source Hardening
+
+**Updated:** `ingestion/sources/rss_feeds.py`
+**New module:** `ingestion/feed_health.py`
+
+**Replaced broken feeds:**
+
+| Old Feed | Problem | Replacement |
+|---|---|---|
+| `feeds.reuters.com/Reuters/worldNews` | DNS failure | `reutersagency.com/feed/` |
+| `rsshub.app/apnews/topics/apf-topnews` | 403 Forbidden | `feedx.net/rss/ap.xml` |
+| `maritime-executive.com/blog/feed` | 404 Not Found | `gcaptain.com/feed/` |
+
+**Added feeds:**
+- France24 (`france24.com/en/rss`) — reliable global coverage
+- Deutsche Welle (`rss.dw.com/rdf/rss-en-world`) — reliable global coverage
+- gCaptain (`gcaptain.com/feed/`) — maritime replacement
+- FleetMon News (`fleetmon.com/maritime-news/feed/`) — additional maritime
+
+**Feed health monitoring:**
+- Tracks consecutive failures per feed
+- Suppresses dead feeds after 5 consecutive failures
+- Suppression duration: 1 hour (extends to 4 hours after 3 suppressions)
+- Auto-recovery: suppressed feeds retry after cooldown
+- Per-feed health metrics exposed via `/metrics`
+
+**Expected RSS logs:**
+```
+[RSS] BBC World: parsed 28 items
+[RSS] Reuters World: HTTP 503 (3 consecutive failures)
+[FeedHealth] Suppressing 'Reuters World' for 3600s after 5 consecutive failures
+[RSS] Total: 142 unique events from 11 feeds (active=9 success=8 failed=1 suppressed=2)
+```
+
+---
+
+### Section 4 — Model Preloading
+
+**Updated:** `Dockerfile` (multi-stage build)
+
+Models pre-downloaded during Docker build:
+
+| Model | Size | Purpose |
+|---|---|---|
+| `cross-encoder/nli-MiniLM2-L6-H768` | ~90 MB | Zero-shot classification |
+| `dslim/bert-base-NER` | ~67 MB | Named entity recognition |
+| `en_core_web_sm` | ~15 MB | spaCy NER (primary) |
+
+**Build-time download:**
+```dockerfile
+RUN python -c "\
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification; \
+AutoTokenizer.from_pretrained('cross-encoder/nli-MiniLM2-L6-H768'); \
+AutoModelForSequenceClassification.from_pretrained('cross-encoder/nli-MiniLM2-L6-H768'); \
+AutoTokenizer.from_pretrained('dslim/bert-base-NER'); \
+AutoModel.from_pretrained('dslim/bert-base-NER'); \
+"
+```
+
+**Runtime enforcement:**
+```
+TRANSFORMERS_OFFLINE=1
+HF_HUB_OFFLINE=1
+```
+
+These environment variables ensure the worker never attempts network downloads at runtime. If a model is missing, the heuristic fallback activates immediately.
+
+**Cold-start improvement:**
+- Before: 30-60s (downloading models on first inference)
+- After: <5s (loading from local cache)
+
+---
+
+### Section 5 — Docker Optimization
+
+**Updated:** `Dockerfile` (multi-stage)
+
+| Metric | Before (Log13) | After (Log15) | Change |
+|---|---|---|---|
+| Build stages | 1 | 2 (builder + runtime) | Multi-stage |
+| `build-essential` in runtime | Yes (~200 MB) | No | Removed |
+| `libgdal-dev` in runtime | Yes (~150 MB) | No | Removed |
+| Model downloads | Runtime | Build-time cached | Faster startup |
+| HF cache duplication | Possible | Single copy via COPY --from | Deduped |
+| Target image size | ~3 GB | <1.5 GB | **~50% reduction** |
+
+**Layer structure:**
+```
+Stage 1 (builder — discarded):
+  python:3.11-slim + build-essential
+  pip install --prefix=/install
+  spaCy model download
+  HuggingFace model pre-cache
+
+Stage 2 (runtime — final image):
+  python:3.11-slim (no build tools)
+  COPY --from=builder /install → Python packages
+  COPY --from=builder /opt/hf_cache → HF models
+  COPY . → Application code
+  Non-root appuser
+```
+
+---
+
+### Section 6 — Entity Normalization
+
+**New module:** `ingestion/entity_normalizer.py`
+**Updated:** `ingestion/normalize.py`
+
+Pipeline applied to NER entities before geocoding:
+
+```
+Raw NER entity
+    │
+    ▼
+1. Unicode NFC normalization
+2. Strip HTML entities + control characters
+3. Remove possessives ('s)
+4. Strip trailing punctuation
+5. Abbreviation expansion (US→United States, UK→United Kingdom, etc.)
+6. Garbage pattern rejection:
+   - Single/double letters
+   - Pure numbers
+   - URLs
+   - News org names (AP, Reuters, BBC...)
+   - Organization names (NATO, UN, OPEC...)
+   - Time references (Monday, January, 2026...)
+   - Pure punctuation
+7. Digit ratio check (reject >50% digits)
+8. Title case normalization
+    │
+    ▼
+Cleaned entity (or None if rejected)
+```
+
+**Abbreviation map (excerpt):**
+```
+US, USA, U.S., U.S.A. → United States
+UK, U.K.              → United Kingdom
+UAE, U.A.E.            → United Arab Emirates
+DPRK                   → North Korea
+KSA                    → Saudi Arabia
+DRC                    → Democratic Republic of Congo
+```
+
+**Expected reduction in geocoding failures:**
+- "Nominatim returned no result for 'AP'" → filtered
+- "Nominatim returned no result for 'NATO'" → filtered
+- "Nominatim returned no result for '2026'" → filtered
+- "US" → normalized to "United States" → geocode succeeds
+
+---
+
+### Section 7 — Observability
+
+**Updated:** `core/metrics.py`
+
+New metrics added to `/metrics` endpoint:
+
+| Category | Metrics |
+|---|---|
+| **Quotas** | Per-source used/limit/remaining/exhausted status |
+| **Feed Health** | Per-feed healthy/suppressed/consecutive_failures/success_rate |
+| **Rate Limits** | Per-source consecutive_429s/total_429s/cooldown state |
+| **Geocoding** | geocode_attempts, geocode_failures |
+| **Entity Normalization** | entities_normalized, entities_rejected |
+| **Source Failures** | feeds_suppressed, feeds_recovered |
+
+**Sample `/metrics` response (new fields):**
+```json
+{
+  "counters": {
+    "geocode_attempts": 234,
+    "geocode_failures": 12,
+    "entities_rejected": 45,
+    "rate_limit_429s": 3,
+    "feeds_suppressed": 1
+  },
+  "quotas": {
+    "newsapi": {"used_today": 12, "daily_limit": 50, "remaining": 38, "exhausted": false},
+    "gnews": {"used_today": 50, "daily_limit": 50, "remaining": 0, "exhausted": true},
+    "gdelt": {"used_today": 8, "daily_limit": 500, "remaining": 492, "exhausted": false}
+  },
+  "feed_health": {
+    "BBC World": {"healthy": true, "consecutive_failures": 0, "success_rate": 1.0},
+    "Reuters World": {"healthy": false, "suppressed": true, "consecutive_failures": 7}
+  },
+  "rate_limits": {
+    "gdelt": {"consecutive_429s": 0, "total_429s": 3, "in_cooldown": false}
+  }
+}
+```
+
+---
+
+### Section 8 — Verification
+
+**Verification commands:**
+
+```bash
+# Syntax check — all modules compile
+python -m compileall app core ingestion ml storage config run_live.py
+
+# Unit tests
+pytest
+
+# Quick run (cached data)
+python run_live.py --origin "Mumbai, India" --destination "Dubai, UAE"
+
+# Run API server
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Check health
+curl http://localhost:8000/health
+
+# Check metrics (includes quota + feed health)
+curl http://localhost:8000/metrics
+
+# Run worker (single cycle)
+python -m ingestion.realtime_worker --once
+
+# Docker build
+docker compose build
+
+# Docker run
+docker compose up -d mongo api worker
+```
+
+**Expected worker logs (single cycle):**
+
+```
+Config loaded: mongo=localhost:27017 newsapi=set gnews=set quotas=[newsapi=50/day gnews=50/day gdelt=500/day] intervals=[rss=180s gdelt=900s newsapi=1800s gnews=1800s]
+QuotaManager initialized: newsapi=0/50(ok) | gnews=0/50(ok) | gdelt=0/500(ok) | rss=0/999999(ok)
+Real-time ingestion worker started (interval=180s, mongo=localhost:27017/geo_risk)
+=== Ingestion cycle #1 starting ===
+Quota state: newsapi=0/50(ok) | gnews=0/50(ok) | gdelt=0/500(ok) | rss=0/999999(ok)
+[GDELT DOC] 25 articles fetched.
+[newsapi] quota used: 1/50
+[gnews] quota used: 1/50
+[RSS] BBC World: parsed 28 items
+[RSS] Total: 142 unique events from 11 feeds (active=9 success=8 failed=1 suppressed=0)
+Multi-source fetch: 187 total events {'gdelt': 25, 'rss': 142, 'newsapi': 12, 'gnews': 8}
+Pre-filter: 180 → 175 relevant (rejected 5)
+[Batch ML] Classified 175 events in one pass.
+Entity normalization: 523 → 489 (filtered 34 garbage tokens)
+Ingestion cycle complete: fetched=187 enriched=165 clustered=165→152 written=152 skipped=22 errors=0 (12.3s) | Quotas: newsapi=1/50(ok) | gnews=1/50(ok) | gdelt=1/500(ok)
+```
+
+**Expected quota exhaustion logs:**
+
+```
+=== Ingestion cycle #48 starting ===
+Quota state: newsapi=50/50(exhausted) | gnews=50/50(exhausted) | gdelt=45/500(ok)
+[newsapi] quota exhausted, skipping until reset at 14:30 UTC (50/50 used)
+[gnews] quota exhausted, skipping until reset at 14:30 UTC (50/50 used)
+[GDELT DOC] 25 articles fetched.
+[RSS] Total: 138 unique events from 11 feeds
+Multi-source fetch: 163 total events {'gdelt': 25, 'rss': 138}
+```
+
+---
+
+### Files Created
+
+| File | Purpose |
+|---|---|
+| `ingestion/quota_manager.py` | Rolling 24h quota tracking + persistence |
+| `ingestion/rate_limiter.py` | Exponential backoff + jitter + cooldown |
+| `ingestion/feed_health.py` | RSS feed health monitoring + dead-feed suppression |
+| `ingestion/entity_normalizer.py` | NER entity cleaning before geocoding |
+
+### Files Modified
+
+| File | Change |
+|---|---|
+| `ingestion/gdelt.py` | Rate limiter integration, quota-aware, structured backoff |
+| `ingestion/sources/newsapi.py` | Quota-aware fetching, single rotated query per cycle |
+| `ingestion/sources/rss_feeds.py` | Replaced 3 dead feeds, feed health monitoring, User-Agent |
+| `ingestion/realtime_worker.py` | Quota-aware scheduling, structured quota logging |
+| `ingestion/normalize.py` | Entity normalization pipeline integration |
+| `core/metrics.py` | Added quota, feed health, geocoding, rate limit metrics |
+| `config/settings.py` | Added quota, interval, rate limit config vars |
+| `Dockerfile` | Multi-stage build, model preloading, TRANSFORMERS_OFFLINE |
+| `docker-compose.yml` | Quota config env vars, quota state volume, offline mode |
+| `.env` | Added quota and rate limit configuration |
+| `.env.example` | Full documented configuration reference |
+
+---
+
+### Architecture Invariants Preserved
+
+- Worker service: unchanged role (ingestion + ML enrichment)
+- API service: unchanged role (read-only analysis, no ML)
+- MongoDB: unchanged schema + indexes
+- ML pipeline: unchanged models, unchanged inference
+- Route analysis: unchanged orchestrator logic
+- Canonical clustering: unchanged (Log12)
+- Batch inference: unchanged (Log11)
+
+---
+
+### Remaining Limitations
+
+1. Quota state persists to local file — lost if Docker volume is not mounted.
+2. Feed health resets on worker restart (in-process state).
+3. Rate limiter state resets on worker restart (in-process state).
+4. Metrics still in-process and reset on restart.
+5. Cold geocoding remains first-run bottleneck (entity normalization reduces but doesn't eliminate).
+6. Multi-stage Docker build increases build time but reduces runtime image size.
+
+---
+<!-- END OF LOG15 — DO NOT REMOVE THIS LINE -->

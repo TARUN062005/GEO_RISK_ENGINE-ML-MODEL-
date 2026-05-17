@@ -1,11 +1,19 @@
 """
 core/metrics.py
 ---------------
-Lightweight Pipeline Metrics (Log12)
+Lightweight Pipeline Metrics (Log12, extended Log15)
 
 Provides structured observability for the geo-intelligence pipeline.
 No external dependencies (no Prometheus, no StatsD).
 Thread-safe via simple dict + increment pattern.
+
+Log15: Added metrics for:
+  - API quota usage (per source)
+  - Source failures + feed health
+  - Ingestion latency breakdown
+  - Geocoding failures
+  - Entity normalization stats
+  - Rate limiter state
 
 Exposes:
   - ingestion counts (per source, per cycle)
@@ -14,6 +22,9 @@ Exposes:
   - clustering stats
   - runtime timings
   - error counts
+  - quota usage (Log15)
+  - feed health (Log15)
+  - geocoding quality (Log15)
 
 Used by:
   - ingestion/realtime_worker.py
@@ -62,6 +73,18 @@ _counters: dict[str, int] = {
     "source_rss": 0,
     "source_newsapi": 0,
     "source_gnews": 0,
+    # Log15: Geocoding quality
+    "geocode_attempts": 0,
+    "geocode_failures": 0,
+    # Log15: Entity normalization
+    "entities_normalized": 0,
+    "entities_rejected": 0,
+    # Log15: Feed health
+    "feeds_suppressed": 0,
+    "feeds_recovered": 0,
+    # Log15: Rate limiting
+    "rate_limit_429s": 0,
+    "rate_limit_cooldowns": 0,
 }
 
 _timings: dict[str, list[float]] = {
@@ -103,11 +126,34 @@ def get_metrics() -> dict[str, Any]:
             else:
                 timing_stats[key] = {"count": 0}
 
-        return {
+        result = {
             "uptime_seconds": round(time.time() - _startup_time, 1),
             "counters": dict(_counters),
             "timings": timing_stats,
         }
+
+    # Log15: Include quota states if available
+    try:
+        from ingestion.quota_manager import get_quota_manager
+        result["quotas"] = get_quota_manager().get_all_quotas()
+    except Exception:
+        pass
+
+    # Log15: Include feed health if available
+    try:
+        from ingestion.feed_health import get_all_feed_health
+        result["feed_health"] = get_all_feed_health()
+    except Exception:
+        pass
+
+    # Log15: Include rate limiter states if available
+    try:
+        from ingestion.rate_limiter import get_all_rate_limit_states
+        result["rate_limits"] = get_all_rate_limit_states()
+    except Exception:
+        pass
+
+    return result
 
 
 def log_cycle_stats(stats: dict) -> None:
