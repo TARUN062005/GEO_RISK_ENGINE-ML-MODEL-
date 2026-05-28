@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 # Configuration defaults
 # ---------------------------------------------------------------------------
 
-# Daily quota budgets (conservative — well under free-tier caps)
+# Daily quota budgets (Log16: match free-tier hard caps)
 DEFAULT_QUOTAS = {
-    "newsapi": int(os.environ.get("NEWSAPI_DAILY_QUOTA", "50")),
-    "gnews": int(os.environ.get("GNEWS_DAILY_QUOTA", "50")),
+    "newsapi": int(os.environ.get("NEWSAPI_DAILY_QUOTA", "100")),
+    "gnews": int(os.environ.get("GNEWS_DAILY_QUOTA", "100")),
     "gdelt": int(os.environ.get("GDELT_DAILY_QUOTA", "500")),  # soft limit
 }
 

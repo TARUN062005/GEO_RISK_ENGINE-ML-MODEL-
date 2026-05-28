@@ -50,26 +50,32 @@ services:
       MONGO_URI: mongodb://mongo:27017
       MONGO_DB: geo_risk
       MONGO_COLLECTION: geo_events
-      # Log15: Quota-aware scheduling config
-      NEWSAPI_DAILY_QUOTA: "50"
-      GNEWS_DAILY_QUOTA: "50"
+      # Log16: Quota-aware scheduling config (hard daily limits)
+      NEWSAPI_DAILY_QUOTA: "100"
+      GNEWS_DAILY_QUOTA: "100"
       GDELT_DAILY_QUOTA: "500"
       RSS_INTERVAL_SECONDS: "180"
       GDELT_INTERVAL_SECONDS: "900"
       NEWSAPI_INTERVAL_SECONDS: "1800"
       GNEWS_INTERVAL_SECONDS: "1800"
-      # Log15: Pre-cached models available offline
-      TRANSFORMERS_OFFLINE: "1"
+      # Log16: No transformers/torch installed — pure lightweight NLP
       HF_HUB_OFFLINE: "1"
+      # Log16: Memory optimization for Render Free Tier (512MB)
+      MALLOC_TRIM_THRESHOLD_: "65536"
+      PYTHONMALLOC: "malloc"
     depends_on:
       mongo:
         condition: service_healthy
-    # Log15: Worker runs at base 180s interval; per-source scheduling is handled
-    # internally by QuotaManager (RSS: 3min, GDELT: 15min, APIs: 30min)
+    # Log16: Worker runs at base 180s interval; pure heuristic ML, no model loading
     command: ["python", "-m", "ingestion.realtime_worker", "--interval", "180"]
     volumes:
       # Log15: Persist quota state across restarts
       - quota_state:/app/.quota_state
+    # Log16: Memory limit for Render Free Tier safety
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   redis:
     image: redis:7-alpine

@@ -1,7 +1,7 @@
 """
 ingestion/realtime_worker.py
 ----------------------------
-Real-Time Continuous Ingestion Worker (Log5, hardened Log15)
+Real-Time Continuous Ingestion Worker (Log5, hardened Log15, optimized Log16)
 
 Replaces batch-only ingestion with a continuous hybrid system:
   - Fetches from GDELT, RSS feeds, and News APIs
@@ -18,6 +18,13 @@ Log15: Production hardening.
   - Feed health monitoring
   - Graceful skip when quotas exhausted
 
+Log16: Render Free Tier optimization.
+  - Memory monitoring with gc.collect() after each cycle
+  - Memory guard (aggressive cleanup if >400MB)
+  - Generator-based processing for reduced peak memory
+  - All transformer models removed — pure heuristic ML
+  - Target: <350MB runtime on 512MB Render Free Tier
+
 Does NOT replace ingestion/worker.py — extends it.
 The existing ingest_batch() remains available for manual/cron use.
 
@@ -29,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import logging
 import os
@@ -58,6 +66,68 @@ from core.geo.zones import match_event_to_zones
 from core import metrics
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Log16: Memory monitoring utilities
+# ---------------------------------------------------------------------------
+
+_MEMORY_WARNING_MB = 400  # Trigger aggressive cleanup above this
+_MEMORY_LIMIT_MB = 480    # Hard warning threshold
+
+
+def _get_memory_mb() -> float:
+    """Get current process RSS memory in MB."""
+    try:
+        import resource
+        # Linux: getrusage returns KB on some systems, bytes on others
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        return rusage.ru_maxrss / 1024  # Convert KB to MB
+    except ImportError:
+        pass
+    try:
+        # Fallback: read /proc/self/status on Linux
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024  # KB to MB
+    except (FileNotFoundError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def _memory_cleanup(force: bool = False) -> float:
+    """
+    Log16: Run garbage collection and return current memory usage.
+    If force=True or memory > warning threshold, run aggressive cleanup.
+    """
+    mem_before = _get_memory_mb()
+
+    if force or mem_before > _MEMORY_WARNING_MB:
+        # Aggressive: collect all generations
+        gc.collect(2)
+        gc.collect(1)
+        gc.collect(0)
+    else:
+        # Light: just generation 0
+        gc.collect(0)
+
+    mem_after = _get_memory_mb()
+
+    if mem_before > 0:
+        freed = mem_before - mem_after
+        if freed > 1:
+            logger.info(
+                "Memory cleanup: %.1fMB → %.1fMB (freed %.1fMB)",
+                mem_before, mem_after, freed,
+            )
+
+    if mem_after > _MEMORY_LIMIT_MB:
+        logger.warning(
+            "⚠️  Memory usage HIGH: %.1fMB / 512MB limit!",
+            mem_after,
+        )
+
+    return mem_after
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -489,16 +559,24 @@ async def run_continuous(
     cycle_count = 0
     while not _shutdown_event.is_set():
         cycle_count += 1
-        logger.info("=== Ingestion cycle #%d starting ===", cycle_count)
+        mem_mb = _get_memory_mb()
+        logger.info("=== Ingestion cycle #%d starting === (Memory: %.1fMB)", cycle_count, mem_mb)
 
         try:
             stats = await ingest_cycle(collection)
+
+            # Log16: Memory monitoring after each cycle
+            mem_after = _memory_cleanup()
+            stats["memory_mb"] = round(mem_after, 1)
+
             logger.info(
                 "Cycle #%d stats: %s",
                 cycle_count, stats,
             )
         except Exception as exc:
             logger.exception("Cycle #%d failed: %s", cycle_count, exc)
+            # Log16: Force cleanup after errors to prevent leak accumulation
+            _memory_cleanup(force=True)
 
         if run_once:
             break

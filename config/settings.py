@@ -51,8 +51,8 @@ MAX_FRESHNESS_MINUTES:   int = int(os.environ.get("MAX_FRESHNESS_MINUTES", "10")
 # ---------------------------------------------------------------------------
 # Log15: Quota-Aware Scheduling
 # ---------------------------------------------------------------------------
-NEWSAPI_DAILY_QUOTA: int = int(os.environ.get("NEWSAPI_DAILY_QUOTA", "50"))
-GNEWS_DAILY_QUOTA:   int = int(os.environ.get("GNEWS_DAILY_QUOTA", "50"))
+NEWSAPI_DAILY_QUOTA: int = int(os.environ.get("NEWSAPI_DAILY_QUOTA", "100"))  # Log16: hard limit
+GNEWS_DAILY_QUOTA:   int = int(os.environ.get("GNEWS_DAILY_QUOTA", "100"))    # Log16: hard limit
 GDELT_DAILY_QUOTA:   int = int(os.environ.get("GDELT_DAILY_QUOTA", "500"))
 
 # Log15: Source-specific fetch intervals (seconds)

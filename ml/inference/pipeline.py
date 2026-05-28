@@ -1,12 +1,15 @@
 """
 ml/inference/pipeline.py
 ------------------------
-ML Inference Pipeline — Ingestion Layer (Log2, upgraded Log11)
+ML Inference Pipeline — Ingestion Layer (Log2, upgraded Log11, optimized Log16)
 
 Log11: Added run_ml_inference_batch() for batch processing.
-  - Batch classifier: one forward pass for N texts
-  - NER + scoring still per-event (spaCy is already fast)
-  - Net effect: ~2-4x fewer transformer forward passes
+Log16: All classification now uses lightweight keyword heuristics.
+  - No transformer models loaded — zero GPU/CUDA dependencies
+  - Batch classifier: iterates heuristic rules (fast, no forward pass)
+  - NER: spaCy en_core_web_sm only (~15MB)
+  - Memory: <50MB total for entire ML pipeline
+  - Net effect: fits within Render Free Tier 512MB RAM
 
 The API NEVER imports this module.
 """

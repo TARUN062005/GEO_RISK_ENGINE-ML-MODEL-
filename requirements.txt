@@ -1,7 +1,5 @@
-# Core ML dependencies
-transformers>=4.40.0          # Zero-shot classification + NER
-torch>=2.2.0                  # CPU-only inference (no CUDA required)
-spacy>=3.7.0                  # Primary NER (en_core_web_sm)
+# Core NLP (lightweight only — Log16)
+spacy>=3.7.0                  # Primary NER (en_core_web_sm, ~15MB)
 
 # Feature engineering + aggregation
 numpy>=1.26.0
@@ -31,6 +29,13 @@ aiofiles>=23.2.1
 structlog>=24.1.0
 prometheus-client>=0.20.0
 
+# Utilities
+python-dotenv>=1.0.0          # .env file loading
+
 # Dev / Test
 pytest>=8.2.0
 pytest-asyncio>=0.23.0
+
+# Log16: REMOVED transformers, torch, and all HuggingFace dependencies.
+# These caused OOM on Render Free Tier (512MB RAM).
+# Classification now uses keyword heuristics; NER uses spaCy only.
