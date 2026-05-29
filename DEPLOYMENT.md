@@ -93,17 +93,27 @@ curl https://<api-host>/health
 curl https://<api-host>/ready
 ```
 
-## Step 5 - Deploy Worker Service
+## Step 5 - Deploy Worker Service (Background Worker)
 
-Deploy the same Docker image as a separate worker/background service.
+The worker behaves like a continuous background consumer and must be deployed as a **Render Background Worker** (not a Web Service). 
 
-Startup command:
+### Key Worker Deployment Characteristics:
+* **No Open Ports Required:** The background worker does NOT listen on any HTTP port. Render's Background Worker service does not provision public URLs or expect HTTP port binds.
+* **Continuous Process:** Runs indefinitely executing fetching, ML classification, geocoding, and DB writes.
+* **Automatic Restart:** Restarts automatically if the process exits or encounters a fatal crash.
 
+### Startup Command:
+Deploy using the exact same Docker image as the API, but override the start command:
 ```bash
 python -m ingestion.realtime_worker --interval 180
 ```
 
-Use the same Mongo and API-key environment variables as the API. The worker should restart automatically on failure.
+### Environment Variables:
+Copy all database and API-key environment variables from the API Service to the Background Worker:
+* `APP_ENV=production`
+* `MONGO_URI=<your-mongodb-atlas-srv-uri>`
+* `NEWSAPI_KEY=<your-key>`
+* `GNEWS_KEY=<your-key>`
 
 ## Step 6 - MongoDB Setup
 

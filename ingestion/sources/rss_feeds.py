@@ -33,11 +33,10 @@ logger = logging.getLogger(__name__)
 
 RSS_FEEDS: list[dict[str, str]] = [
     # === General World News ===
-    # Log15: Reuters feed replaced (old feeds.reuters.com has DNS failure)
     {
-        "name": "Reuters World",
-        "url": "https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best",
-        "publisher": "Reuters",
+        "name": "New York Times World",
+        "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "publisher": "The New York Times",
     },
     {
         "name": "BBC World",

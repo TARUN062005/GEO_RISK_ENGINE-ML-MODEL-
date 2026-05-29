@@ -176,6 +176,67 @@ def _is_valid_raw_event(ev: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# MongoDB Hardened Operations
+# ---------------------------------------------------------------------------
+async def test_mongodb_connection(client, max_retries: int = 5, base_delay: float = 2.0) -> bool:
+    """
+    Perform startup database connectivity test with exponential backoff.
+    Fails fast (raises exception) if connection fails.
+    """
+    from config.settings import get_mongo_host, MONGO_URI
+    host = get_mongo_host(MONGO_URI)
+    logger.info("Initializing startup MongoDB connectivity test to host: %s", host)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            metrics.inc("mongo_reconnect_attempts")
+            # Ping the admin database to verify connection
+            await client.admin.command("ping")
+            metrics.inc("mongo_reconnect_successes")
+            logger.info("✓ MongoDB connectivity test succeeded! Connected to %s", host)
+            return True
+        except Exception as exc:
+            metrics.inc("error_db_connection")
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "⚠️ MongoDB connectivity test attempt %d/%d failed: %s. Retrying in %.1fs...",
+                attempt, max_retries, exc, delay
+            )
+            if attempt == max_retries:
+                logger.error("❌ MongoDB connection could not be established after %d attempts. Failing fast.", max_retries)
+                raise
+            await asyncio.sleep(delay)
+    return False
+
+
+async def safe_mongo_write(collection, doc: dict, max_retries: int = 3, base_delay: float = 1.0) -> bool:
+    """
+    Safely write a document to MongoDB, with retries and exponential backoff
+    to handle transient connection issues non-blockingly.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            await collection.update_one(
+                {"_id": doc["_id"]},
+                {"$setOnInsert": doc},
+                upsert=True,
+            )
+            return True
+        except Exception as exc:
+            metrics.inc("error_db_write")
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "MongoDB write failed (attempt %d/%d) for event %s: %s. Retrying in %.1fs...",
+                attempt, max_retries, doc.get("_id"), exc, delay
+            )
+            if attempt == max_retries:
+                logger.error("❌ MongoDB write permanently failed for event %s", doc.get("_id"))
+                raise
+            await asyncio.sleep(delay)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Multi-Source Fetch — Log15: Quota-Aware
 # ---------------------------------------------------------------------------
 
@@ -488,11 +549,7 @@ async def ingest_cycle(mongo_collection) -> dict:
     # ── Step 8: Write to MongoDB ──────────────────────────────────────
     for doc in enriched_docs:
         try:
-            await mongo_collection.update_one(
-                {"_id": doc["_id"]},
-                {"$setOnInsert": doc},
-                upsert=True,
-            )
+            await safe_mongo_write(mongo_collection, doc)
             stats["written"] += 1
         except Exception as exc:
             logger.warning("Failed to write event %s: %s", doc.get("_id"), exc)
@@ -537,19 +594,39 @@ async def run_continuous(
     """
     from motor.motor_asyncio import AsyncIOMotorClient
     from config.settings import redact_secret, validate_environment
+    from ml.ner import validate_spacy_model
 
+    # Centralized Startup Validation
+    logger.info("=== Centralized Startup Validation Starting ===")
+    
+    # 1. Environment Validation (includes MongoDB URI check)
     validate_environment()
+    logger.info("✓ Environment validation passed.")
 
-    # Log15: Initialize quota manager at startup
-    from ingestion.quota_manager import get_quota_manager
-    qm = get_quota_manager()
+    # 2. spaCy Model Availability Validation
+    if not validate_spacy_model():
+        metrics.inc("error_spacy_load")
+        raise RuntimeError(
+            "CRITICAL startup failure: spaCy model 'en_core_web_sm' is unavailable. "
+            "Please ensure it is installed correctly via requirements.txt."
+        )
+    logger.info("✓ spaCy model availability validated.")
 
+    # Initialize client
     client = AsyncIOMotorClient(MONGO_URI)
     collection = client[MONGO_DB][MONGO_COLLECTION]
+
+    # 3. MongoDB Connectivity Test (with exponential backoff)
+    await test_mongodb_connection(client)
 
     # Ensure indexes exist
     await _ensure_indexes(collection)
 
+    # Initialize quota manager at startup
+    from ingestion.quota_manager import get_quota_manager
+    qm = get_quota_manager()
+
+    logger.info("=== Centralized Startup Validation Complete — Worker Running Successfully ===")
     logger.info(
         "Real-time ingestion worker started (interval=%ds, mongo=%s/%s) | Quotas: %s",
         interval_seconds, redact_secret(MONGO_URI), MONGO_DB,
@@ -560,7 +637,9 @@ async def run_continuous(
     while not _shutdown_event.is_set():
         cycle_count += 1
         mem_mb = _get_memory_mb()
-        logger.info("=== Ingestion cycle #%d starting === (Memory: %.1fMB)", cycle_count, mem_mb)
+        
+        # Worker heartbeat log
+        logger.info("=== [HEARTBEAT] Ingestion cycle #%d starting === (Memory: %.1fMB)", cycle_count, mem_mb)
 
         try:
             stats = await ingest_cycle(collection)
@@ -575,7 +654,7 @@ async def run_continuous(
             )
         except Exception as exc:
             logger.exception("Cycle #%d failed: %s", cycle_count, exc)
-            # Log16: Force cleanup after errors to prevent leak accumulation
+            # Force cleanup after errors to prevent leak accumulation
             _memory_cleanup(force=True)
 
         if run_once:

@@ -85,6 +85,17 @@ _counters: dict[str, int] = {
     # Log15: Rate limiting
     "rate_limit_429s": 0,
     "rate_limit_cooldowns": 0,
+    # Mongo Reconnection and Write Errors
+    "mongo_reconnect_attempts": 0,
+    "mongo_reconnect_successes": 0,
+    # Structured Error Categories
+    "error_db_connection": 0,
+    "error_db_write": 0,
+    "error_spacy_load": 0,
+    "error_gdelt_api": 0,
+    "error_rss_fetch": 0,
+    "error_newsapi_api": 0,
+    "error_geocoding_api": 0,
 }
 
 _timings: dict[str, list[float]] = {
@@ -111,6 +122,24 @@ def record_timing(key: str, seconds: float) -> None:
             bucket[:] = bucket[-100:]
 
 
+def _get_memory_mb() -> float:
+    """Get current process RSS memory in MB."""
+    try:
+        import resource
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        return rusage.ru_maxrss / 1024  # Convert KB to MB
+    except ImportError:
+        pass
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024  # KB to MB
+    except (FileNotFoundError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
 def get_metrics() -> dict[str, Any]:
     """Return all metrics as a JSON-serializable dict."""
     with _lock:
@@ -130,6 +159,7 @@ def get_metrics() -> dict[str, Any]:
             "uptime_seconds": round(time.time() - _startup_time, 1),
             "counters": dict(_counters),
             "timings": timing_stats,
+            "memory_mb": round(_get_memory_mb(), 1),
         }
 
     # Log15: Include quota states if available

@@ -1,7 +1,7 @@
 """
 ml/ner.py
 ---------
-Location Extraction Module (Log1, optimized Log16)
+Location Extraction Module (Log1, optimized Log16, hardened Log17)
 
 Extracts geopolitical entities (countries, cities, regions) from news text.
 Strategy: spaCy en_core_web_sm  →  regex fallback
@@ -12,6 +12,13 @@ Log16: Removed HuggingFace token-classifier fallback (dslim/bert-base-NER).
   - spaCy en_core_web_sm is the primary NER (~15MB, accurate for locations)
   - Expanded regex fallback with more countries and major cities
   - Zero transformer dependencies
+
+Log17: Fixed spaCy model loading for Docker/Render.
+  - Uses `import en_core_web_sm; en_core_web_sm.load()` instead of
+    fragile `spacy.load("en_core_web_sm")` which fails in multi-stage
+    Docker builds where the model link isn't registered.
+  - Singleton pattern with _loaded flag to prevent repeated warning spam.
+  - Startup validation helper: validate_spacy_model().
 
 Labels of interest: GPE (Geo-Political Entity), LOC (Location), FAC (Facility)
 """
@@ -58,20 +65,32 @@ class NERResult:
 
 # ---------------------------------------------------------------------------
 # Strategy 1: spaCy (primary, lightweight ~15 MB)
+# Log17: Fixed model loading — uses direct package import, not spacy.load()
 # ---------------------------------------------------------------------------
 
 class SpacyNER:
     _nlp = None
+    _load_attempted = False  # Log17: prevent repeated load attempts
 
     def _load(self):
-        if SpacyNER._nlp is None:
-            try:
-                import spacy  # type: ignore
-                SpacyNER._nlp = spacy.load("en_core_web_sm")
-                logger.info("spaCy model loaded: en_core_web_sm")
-            except Exception as exc:
-                logger.warning("spaCy load failed (%s).", exc)
-                SpacyNER._nlp = None
+        if SpacyNER._nlp is not None:
+            return  # Already loaded
+
+        if SpacyNER._load_attempted:
+            return  # Already tried and failed — don't spam warnings
+
+        SpacyNER._load_attempted = True
+
+        try:
+            import en_core_web_sm  # type: ignore
+            SpacyNER._nlp = en_core_web_sm.load()
+            logger.info("spaCy model loaded via direct package import: en_core_web_sm")
+        except Exception as exc:
+            logger.warning(
+                "spaCy NER unavailable: direct import of en_core_web_sm failed: %s. "
+                "Falling back to regex-only NER.",
+                exc,
+            )
 
     def extract(self, text: str) -> Optional[NERResult]:
         self._load()
@@ -177,12 +196,30 @@ _spacy_ner = SpacyNER()
 def extract_locations(text: str) -> NERResult:
     """
     Log16: Cascading NER — spaCy → regex fallback.
-    HuggingFace NER removed to eliminate transformer/torch dependency.
+    Log17: Uses direct import for Docker reliability.
     Always returns a NERResult (never raises).
     """
     result = _spacy_ner.extract(text)
     if result is not None:
         return result
 
-    logger.debug("spaCy NER unavailable. Using regex fallback.")
+    # Log17: Only log once (controlled by _load_attempted flag)
     return _regex_extract(text)
+
+
+def validate_spacy_model() -> bool:
+    """
+    Log17: Startup validation — check if spaCy model is available.
+    Returns True if spaCy is usable, False if falling back to regex.
+    """
+    _spacy_ner._load()
+    available = SpacyNER._nlp is not None
+    if available:
+        logger.info("✓ spaCy NER validated: en_core_web_sm loaded")
+    else:
+        logger.warning(
+            "✗ spaCy NER unavailable — using regex-only NER. "
+            "Install model: python -m spacy download en_core_web_sm"
+        )
+    return available
+

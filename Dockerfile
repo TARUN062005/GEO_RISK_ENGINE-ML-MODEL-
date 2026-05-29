@@ -1,15 +1,16 @@
 # ============================================================================
-# Geo Risk Engine — Production Dockerfile (Log16)
+# Geo Risk Engine — Production Dockerfile (Log16, hardened Log17)
 #
 # Log16: Lightweight build — NO transformers, NO torch, NO CUDA.
-#   - Removed HuggingFace model pre-caching (saves ~1.5GB)
-#   - Removed torch/transformers dependencies (saves ~800MB)
-#   - spaCy en_core_web_sm is the only ML model (~15MB)
-#   - Target: <800MB image (down from ~3GB)
-#   - Runtime memory: <350MB (fits Render Free Tier 512MB)
+# Log17: Fixed spaCy model loading for Render deployment.
+#   - spaCy model installed as pip package (not just downloaded)
+#   - Ensures `import en_core_web_sm` works in runtime stage
+#   - Separate API vs Worker CMD support
+#   - No HTTP port required for worker mode
+#   - Target: <800MB image, <200MB runtime memory
 #
 # Multi-stage build:
-#   Stage 1 (builder): Install deps + pre-cache spaCy model
+#   Stage 1 (builder): Install deps + pip install spaCy model
 #   Stage 2 (runtime): Slim image with only runtime files
 # ============================================================================
 
@@ -32,9 +33,11 @@ COPY requirements.txt .
 RUN python -m pip install --upgrade pip \
     && pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# Pre-download spaCy model (the ONLY ML model needed)
-RUN PYTHONPATH=/install/lib/python3.11/site-packages \
-    python -m spacy download en_core_web_sm
+# Log17: Install spaCy model as a proper pip package (not just `spacy download`)
+# This ensures `import en_core_web_sm` works reliably in the runtime stage,
+# even without spacy's model registry / symlinks.
+RUN pip install --no-cache-dir --prefix=/install \
+    https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
@@ -48,7 +51,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     # Log16: Disable torch — not installed
-    PYTORCH_NO_CUDA=1
+    PYTORCH_NO_CUDA=1 \
+    # Log17: Memory optimization for Render Free Tier
+    MALLOC_TRIM_THRESHOLD_=65536 \
+    PYTHONMALLOC=malloc
 
 WORKDIR /app
 
@@ -57,11 +63,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed Python packages from builder
+# Copy installed Python packages from builder (includes spaCy model as package)
 COPY --from=builder /install /usr/local
-
-# Copy spaCy model data
-COPY --from=builder /usr/local/lib/python3.11/site-packages/en_core_web_sm /usr/local/lib/python3.11/site-packages/en_core_web_sm
 
 # Copy application code
 COPY . .
@@ -73,9 +76,13 @@ RUN useradd --create-home --shell /usr/sbin/nologin appuser \
     && chown -R appuser:appuser /app/.quota_state
 USER appuser
 
-EXPOSE 8000
+# Log17: Validate spaCy model is importable at build time
+RUN python -c "import en_core_web_sm; nlp = en_core_web_sm.load(); print('spaCy model validated:', nlp.meta['name'])"
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()" || exit 1
+# Log17: No EXPOSE or HEALTHCHECK for worker mode.
+# API mode uses: EXPOSE 8000 + uvicorn
+# Worker mode uses: python -m ingestion.realtime_worker
+# The correct CMD is set by docker-compose or Render service config.
 
+# Default CMD: API mode (overridden by docker-compose for worker)
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers"]

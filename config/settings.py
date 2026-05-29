@@ -29,11 +29,66 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# MongoDB
+# MongoDB Helper Functions
 # ---------------------------------------------------------------------------
-MONGO_URI:        str = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+def sanitize_mongo_uri(uri: str) -> str:
+    """Return a version of the MongoDB URI safe for logs (password masked)."""
+    if not uri:
+        return ""
+    import re
+    # Mask password: matches "mongodb://username:password@host" or "mongodb+srv://username:password@host"
+    return re.sub(r'(mongodb(?:\+srv)?://[^:]+:)([^@]+)(@)', r'\1*****\3', uri)
+
+
+def get_mongo_host(uri: str) -> str:
+    """Extract host and port from MongoDB URI for clean, safe logging."""
+    if not uri:
+        return "none"
+    try:
+        # Strip protocol
+        rest = uri.split("://", 1)[-1]
+        # Strip credentials if present
+        if "@" in rest:
+            rest = rest.split("@", 1)[-1]
+        # Strip path and options
+        host = rest.split("/", 1)[0].split("?", 1)[0]
+        return host
+    except Exception:
+        return "unknown"
+
+
+def validate_mongo_uri(uri: str) -> None:
+    """Fail fast if the MongoDB URI is malformed or contains unconfigured placeholders."""
+    if not uri:
+        raise ValueError("CRITICAL: MONGO_URI is empty or not provided.")
+
+    if not (uri.startswith("mongodb://") or uri.startswith("mongodb+srv://")):
+        raise ValueError(
+            f"CRITICAL: Invalid MongoDB URI protocol in: '{sanitize_mongo_uri(uri)}'. "
+            "Must start with 'mongodb://' or 'mongodb+srv://'."
+        )
+
+    # Check for common placeholders
+    placeholders = [
+        "<username>", "<password>", "<your-password>", "<cluster>",
+        "username:password", "your-cluster-url", "your-database",
+        "cluster.mongodb.net"  # Default cluster placeholder host
+    ]
+    for ph in placeholders:
+        if ph in uri.lower():
+            raise ValueError(
+                f"CRITICAL: MongoDB URI contains unconfigured placeholder '{ph}': "
+                f"'{sanitize_mongo_uri(uri)}'. Please check your environment variables."
+            )
+
+
+# ---------------------------------------------------------------------------
+# MongoDB Configuration
+# ---------------------------------------------------------------------------
 MONGO_DB:         str = os.environ.get("MONGO_DB", "geo_risk")
 MONGO_COLLECTION: str = os.environ.get("MONGO_COLLECTION", "geo_events")
+MONGO_URI:        str = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+
 
 # ---------------------------------------------------------------------------
 # API keys (optional)
@@ -117,8 +172,8 @@ def validate_environment() -> None:
     Lightweight startup validation. Optional API keys may be absent, but core
     deployment settings must be sane and secrets must not be logged raw.
     """
-    if not MONGO_URI:
-        raise ValueError("MONGO_URI is required")
+    validate_mongo_uri(MONGO_URI)
+
     if ROUTE_BUFFER_KM <= 0:
         raise ValueError("ROUTE_BUFFER_KM must be positive")
     if not (0.0 <= MIN_LABEL_CONFIDENCE <= 1.0):
@@ -131,7 +186,7 @@ def validate_environment() -> None:
         "Config loaded: mongo=%s newsapi=%s gnews=%s "
         "quotas=[newsapi=%d/day gnews=%d/day gdelt=%d/day] "
         "intervals=[rss=%ds gdelt=%ds newsapi=%ds gnews=%ds]",
-        MONGO_URI.split("@")[-1],
+        get_mongo_host(MONGO_URI),
         "set" if NEWSAPI_KEY else "unset",
         "set" if GNEWS_KEY else "unset",
         NEWSAPI_DAILY_QUOTA, GNEWS_DAILY_QUOTA, GDELT_DAILY_QUOTA,
