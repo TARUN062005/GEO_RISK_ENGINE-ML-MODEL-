@@ -33,9 +33,10 @@
     "source": "rss",
     "daily_limit": 999999,
     "requests": [
-      1780045665.320385
+      1780045665.320385,
+      1780045893.48961
     ],
-    "last_fetch_at": 1780045665.320385,
+    "last_fetch_at": 1780045893.48961,
     "cooldown_until": 0.0,
     "consecutive_failures": 0
   }
