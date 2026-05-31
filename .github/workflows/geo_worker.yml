@@ -1,0 +1,35 @@
+name: Geo Risk Engine Real-Time Ingestion Worker
+
+on:
+  schedule:
+    # Run every 60 minutes (hourly) by default
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-ingestion-worker:
+    runs-on: ubuntu-latest
+    # Enforce strict 5-minute timeout for budget protection
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run worker once
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          GNEWS_KEY: ${{ secrets.GNEWS_KEY }}
+        run: python -m ingestion.realtime_worker --once

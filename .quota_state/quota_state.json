@@ -3,9 +3,9 @@
     "source": "newsapi",
     "daily_limit": 50,
     "requests": [
-      1780045666.5584824
+      1780235097.617255
     ],
-    "last_fetch_at": 1780045666.5584824,
+    "last_fetch_at": 1780235097.617255,
     "cooldown_until": 0.0,
     "consecutive_failures": 0
   },
@@ -13,9 +13,9 @@
     "source": "gnews",
     "daily_limit": 50,
     "requests": [
-      1780045668.4933226
+      1780235100.5550878
     ],
-    "last_fetch_at": 1780045668.4933226,
+    "last_fetch_at": 1780235100.5550878,
     "cooldown_until": 0.0,
     "consecutive_failures": 0
   },
@@ -23,9 +23,9 @@
     "source": "gdelt",
     "daily_limit": 500,
     "requests": [
-      1780045656.748557
+      1780235373.6634583
     ],
-    "last_fetch_at": 1780045656.748557,
+    "last_fetch_at": 1780235373.6634583,
     "cooldown_until": 0.0,
     "consecutive_failures": 0
   },
@@ -33,10 +33,10 @@
     "source": "rss",
     "daily_limit": 999999,
     "requests": [
-      1780045665.320385,
-      1780045893.48961
+      1780235096.373716,
+      1780235384.3534884
     ],
-    "last_fetch_at": 1780045893.48961,
+    "last_fetch_at": 1780235384.3534884,
     "cooldown_until": 0.0,
     "consecutive_failures": 0
   }

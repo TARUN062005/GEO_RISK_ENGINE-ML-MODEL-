@@ -592,6 +592,9 @@ async def run_continuous(
         interval_seconds: Seconds between fetch cycles (default 180 = 3 min)
         run_once:         If True, run one cycle and exit (for testing)
     """
+    import time
+    start_time = time.time()
+
     from motor.motor_asyncio import AsyncIOMotorClient
     from config.settings import redact_secret, validate_environment
     from ml.ner import validate_spacy_model
@@ -656,8 +659,19 @@ async def run_continuous(
             logger.exception("Cycle #%d failed: %s", cycle_count, exc)
             # Force cleanup after errors to prevent leak accumulation
             _memory_cleanup(force=True)
+            stats = {"fetched": 0, "enriched": 0, "written": 0, "skipped": 0, "errors": 1}
 
         if run_once:
+            duration_seconds = time.time() - start_time
+            # Print standard cycle complete summary required for GitHub Actions and logging
+            print("\nCycle complete:")
+            print(f"fetched={stats.get('fetched', 0)}")
+            print(f"enriched={stats.get('enriched', 0)}")
+            print(f"clustered={stats.get('clustered_to', 0)}")
+            print(f"written={stats.get('written', 0)}")
+            print(f"errors={stats.get('errors', 0)}")
+            print(f"duration={duration_seconds:.2f}s")
+            sys.stdout.flush()
             break
 
         # Wait for next cycle (interruptible)
@@ -748,3 +762,4 @@ if __name__ == "__main__":
         interval_seconds=args.interval,
         run_once=args.once,
     ))
+    sys.exit(0)

@@ -4215,3 +4215,80 @@ Perform a comprehensive production audit of the background worker, simplify Mong
 
 ---
 <!-- END OF LOG18 — DO NOT REMOVE THIS LINE -->
+
+---
+
+## Log19 — GitHub Actions Migration & Scheduled Ingestion
+
+### Goal
+Migrate the `GEO_RISK_ENGINE` background ingestion worker from a continuously running Render service to a GitHub Actions scheduled execution. Introduce a true `--once` mode with robust error handling, print precise execution statistics, and establish budget protections.
+
+### Proposed Architecture
+
+The API service remains deployed on Render, reading directly from MongoDB. The ingestion worker runs as a serverless job on GitHub Actions every 60 minutes.
+
+```mermaid
+graph TD
+    subgraph Render [Render Cloud]
+        API[Render API] -->|Reads| DB[(MongoDB)]
+    end
+
+    subgraph GitHub [GitHub Actions Workflow]
+        Schedule[Hourly Schedule / Manual Run] -->|Triggers| Worker[Ingestion Worker --once]
+        Worker -->|Fetch RSS, NewsAPI, GNews| Fetch[Fetch Sources]
+        Fetch -->|Classify, Cluster, Enrich| Process[Process Pipeline]
+        Process -->|Writes| DB
+    end
+```
+
+### GitHub Actions Budget Protection Details
+
+* **Default Interval**: Scheduled to run **every 60 minutes** (`0 * * * *`) via cron by default.
+* **Execution Timeout**: A strict **5-minute timeout** (`timeout-minutes: 5`) is enforced at the workflow job level to prevent runaway processes from consuming build minutes.
+* **Logging**: Prints the total run duration in seconds upon completion.
+* **Monthly Usage Estimate**:
+  - Hourly schedule = 24 runs/day = **720 runs/month**.
+  - Since each scheduled run only imports new stories since the previous hour, the average run duration is estimated to be **~1.0 to 1.5 minutes** (with pip dependency caching enabled).
+  - This results in a projected usage of **720 to 1080 minutes/month** (comfortably under the free tier budget).
+  - **Warning Threshold**: If the average run time exceeds **2.08 minutes/run** (due to large backfills or Nominatim geocoding queues), the projected monthly usage will exceed the **1500 minutes/month** budget. In such a scenario, a warning is raised to alert developers.
+
+### Required Secrets
+The following credentials must be configured as **Repository Secrets** in the GitHub repository:
+- `MONGO_URI`: The connection string to your MongoDB database.
+- `NEWSAPI_KEY`: API key for NewsAPI (optional, skipped gracefully if unset).
+- `GNEWS_KEY`: API key for GNews (optional, skipped gracefully if unset).
+
+### Changes Made
+
+#### 1. Ingestion Worker (`ingestion/realtime_worker.py`)
+- Integrated start/end time execution tracking for accurate duration logging.
+- Created a custom stdout print block on `--once` run completion to display stats clearly for GHA runner logging.
+- Wrapped exceptions in `--once` run so that individual feed failures remain non-fatal, ensuring a clean status code `0` exit on completion.
+- Kept the continuous `--interval <seconds>` loop mode intact for local development.
+
+#### 2. Workflow Definition (`.github/workflows/geo_worker.yml`)
+- Created a standard GitHub Actions YAML configuration specifying an hourly cron schedule, a `workflow_dispatch` trigger, a 5-minute timeout, and loading secrets as environment variables.
+
+### Verification Steps
+
+```bash
+# 1. Run the local test suite
+.venv\Scripts\python -m pytest
+
+# 2. Run the ingestion worker locally in --once mode
+.venv\Scripts\python -m ingestion.realtime_worker --once
+```
+
+**Expected stdout summary format:**
+```
+Cycle complete:
+fetched=134
+enriched=112
+clustered=89
+written=89
+errors=0
+duration=144.20s
+```
+
+---
+<!-- END OF LOG19 — DO NOT REMOVE THIS LINE -->
