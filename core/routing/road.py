@@ -35,7 +35,7 @@ from storage.repository import _haversine_km
 logger = logging.getLogger(__name__)
 
 # Distance threshold below which osmnx is attempted (km)
-OSMNX_MAX_DISTANCE_KM = 800.0
+OSMNX_MAX_DISTANCE_KM = -1.0
 
 # ---------------------------------------------------------------------------
 # Continental transit hub waypoints
