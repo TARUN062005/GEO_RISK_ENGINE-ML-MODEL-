@@ -41,6 +41,7 @@ class AnalyzeRequest(BaseModel):
     destination: str = Field(..., description="Destination location (free text)", min_length=2, max_length=160)
     radius_km: float = Field(50.0, ge=1.0, le=500.0, description="Buffer radius in km")
     min_confidence: float = Field(0.50, ge=0.0, le=1.0, description="Min classifier confidence")
+    mode: str | None = Field(None, description="Transport mode: air, sea, road, or null for all")
 
     @field_validator("origin", "destination")
     @classmethod
@@ -253,9 +254,7 @@ async def metrics_endpoint():
 
 async def _run_analysis(req: AnalyzeRequest, request: Request):
     """
-    Full multi-mode risk analysis.
-
-    Returns AIR, SEA, ROAD risk scores with evidence, zones, and source URLs.
+    Risk analysis — routes to single-mode (fast) or multi-mode (full comparison).
     """
     start = time.time()
 
@@ -267,14 +266,27 @@ async def _run_analysis(req: AnalyzeRequest, request: Request):
     collection = client[MONGO_DB][MONGO_COLLECTION]
 
     try:
-        from core.orchestrator import analyze_multi_mode_v5
-        result = await analyze_multi_mode_v5(
-            origin=req.origin,
-            destination=req.destination,
-            mongo_collection=collection,
-            radius_km=req.radius_km,
-            min_confidence=req.min_confidence,
-        )
+        if req.mode and req.mode in ("air", "sea", "road"):
+            # Single-mode: ~3× faster, fits Render free tier
+            from core.orchestrator import analyze_single_mode_v5
+            result = await analyze_single_mode_v5(
+                origin=req.origin,
+                destination=req.destination,
+                mode=req.mode,
+                mongo_collection=collection,
+                radius_km=req.radius_km,
+                min_confidence=req.min_confidence,
+            )
+        else:
+            # Multi-mode: all 3 modes for route comparison
+            from core.orchestrator import analyze_multi_mode_v5
+            result = await analyze_multi_mode_v5(
+                origin=req.origin,
+                destination=req.destination,
+                mongo_collection=collection,
+                radius_km=req.radius_km,
+                min_confidence=req.min_confidence,
+            )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     except Exception:

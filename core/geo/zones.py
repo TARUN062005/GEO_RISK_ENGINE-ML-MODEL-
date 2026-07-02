@@ -338,6 +338,9 @@ def check_route_zone_intersections(
             if dist < min_dist:
                 min_dist = dist
                 closest_idx = i
+            # Early exit: once we're inside the zone, no need to find exact closest
+            if dist <= z.radius_km:
+                break
 
         if min_dist <= z.radius_km:
             intersections.append({

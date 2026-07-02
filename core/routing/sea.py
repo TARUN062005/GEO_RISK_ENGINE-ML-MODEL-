@@ -75,9 +75,24 @@ def generate_sea_route(
             ) * 1.3   # sea routes are ~30% longer than air
 
         logger.info(
-            "Sea route: %d waypoints, %.0f km",
+            "Sea route: %d raw waypoints, %.0f km",
             len(waypoints), total_km,
         )
+
+        # Phase 3: Downsample dense searoute output to max 20 strategic checkpoints
+        # Preserves: origin port (first), destination port (last), evenly-spaced midpoints
+        MAX_SEA_WAYPOINTS = 20
+        if len(waypoints) > MAX_SEA_WAYPOINTS:
+            original_count = len(waypoints)
+            step = (len(waypoints) - 1) / (MAX_SEA_WAYPOINTS - 1)
+            indices = [round(i * step) for i in range(MAX_SEA_WAYPOINTS)]
+            indices[-1] = len(waypoints) - 1  # ensure last point is exact destination
+            waypoints = [waypoints[i] for i in indices]
+            logger.info(
+                "[WAYPOINT REDUCTION] sea: %d → %d waypoints (%.0f%% reduction)",
+                original_count, len(waypoints),
+                (1 - len(waypoints) / original_count) * 100,
+            )
 
         return RouteResult(
             origin=origin,

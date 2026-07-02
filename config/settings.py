@@ -152,7 +152,7 @@ LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
 # Production API
 # ---------------------------------------------------------------------------
 APP_ENV: str = os.environ.get("APP_ENV", "development")
-API_TIMEOUT_SECONDS: float = float(os.environ.get("API_TIMEOUT_SECONDS", "45"))
+API_TIMEOUT_SECONDS: float = float(os.environ.get("API_TIMEOUT_SECONDS", "90"))  # Phase 8: increased from 45 for single-mode headroom
 MAX_REQUEST_BYTES: int = int(os.environ.get("MAX_REQUEST_BYTES", "65536"))
 CORS_ALLOW_ORIGINS: str = os.environ.get("CORS_ALLOW_ORIGINS", "*")
 UVICORN_WORKERS: int = int(os.environ.get("UVICORN_WORKERS", "1"))

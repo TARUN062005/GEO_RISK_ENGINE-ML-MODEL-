@@ -28,6 +28,7 @@ class AnalyzeRequest(BaseModel):
     destination: str = Field(..., min_length=2, examples=["Cairo, Egypt"])
     radius_km: float = Field(default=50.0, ge=10.0, le=500.0)
     min_confidence: float = Field(default=0.50, ge=0.0, le=1.0)
+    mode: str | None = Field(default=None, description="Transport mode: air, sea, road, or null for all")
 
 
 class EventAlert(BaseModel):
@@ -177,3 +178,39 @@ async def analyze_multi_mode_v5_endpoint(
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception:
         raise HTTPException(status_code=500, detail="Pipeline error")
+
+
+@router.post("/analyze/v5/single")
+async def analyze_single_mode_v5_endpoint(
+    body: AnalyzeRequest,
+    collection=Depends(get_mongo_collection),
+):
+    """
+    Single-mode risk analysis — Phase 1 Optimization.
+
+    Analyzes ONLY the requested transport mode (air/sea/road).
+    ~3× faster than /analyze/v5 which computes all 3 modes.
+
+    Requires `mode` field in request body.
+    """
+    if not body.mode or body.mode not in ("air", "sea", "road"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"mode must be 'air', 'sea', or 'road' (got: {body.mode!r})",
+        )
+    try:
+        from core.orchestrator import analyze_single_mode_v5
+        result = await analyze_single_mode_v5(
+            origin=body.origin,
+            destination=body.destination,
+            mode=body.mode,
+            mongo_collection=collection,
+            radius_km=body.radius_km,
+            min_confidence=body.min_confidence,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Pipeline error")
+

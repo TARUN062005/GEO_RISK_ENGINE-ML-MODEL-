@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_RADIUS_KM: float = 50.0      # Buffer around route
-WAYPOINT_SPACING_KM: float = 25.0   # Sample route every N km
+WAYPOINT_SPACING_KM: float = 100.0   # Sample route every N km (Phase 3: increased from 25)
 
 
 # ---------------------------------------------------------------------------

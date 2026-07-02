@@ -687,3 +687,218 @@ async def analyze_multi_mode_v5(
         "modes":              mode_results,
         "analyzed_at":        datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Single-Mode Analysis — Phase 1 Optimization
+# Analyzes ONLY the requested transport mode (3× faster than multi-mode)
+# ---------------------------------------------------------------------------
+
+async def analyze_single_mode_v5(
+    origin: str,
+    destination: str,
+    mode: str,
+    mongo_collection,
+    radius_km: float = 50.0,
+    min_confidence: float = 0.50,
+) -> dict[str, Any]:
+    """
+    Single-mode evidence-enriched analysis.
+
+    Unlike analyze_multi_mode_v5 which computes all 3 modes (air/sea/road),
+    this function computes ONLY the requested mode. This is ~3× faster
+    and fits within Render free tier's 30s request timeout.
+
+    Includes timing instrumentation for observability.
+    """
+    import asyncio
+    import time as _time
+    from core.geo.route import geocode
+    from core.routing.air import generate_air_route
+    from core.routing.sea import generate_sea_route
+    from core.routing.road import generate_road_route
+    from core.routing.cache import get_or_generate_route
+    from core.geo.zones import check_route_zone_intersections, compute_zone_risk
+    from storage.repository import get_events_near_route
+
+    timings: dict[str, float] = {}
+    total_start = _time.time()
+
+    # Validate mode
+    if mode not in ("air", "sea", "road"):
+        raise ValueError(f"Invalid mode: '{mode}'. Must be 'air', 'sea', or 'road'.")
+
+    # ── Step 1: Geocode (cached via LRU) ─────────────────────────────────
+    geo_start = _time.time()
+    origin_geo = await asyncio.to_thread(geocode, origin)
+    if origin_geo is None:
+        raise ValueError(f"Could not geocode origin: '{origin}'")
+
+    dest_geo = await asyncio.to_thread(geocode, destination)
+    if dest_geo is None:
+        raise ValueError(f"Could not geocode destination: '{destination}'")
+    timings["geocoding_ms"] = round((_time.time() - geo_start) * 1000, 1)
+
+    logger.info(
+        "Single-mode analysis [%s]: %s (%.4f,%.4f) → %s (%.4f,%.4f)",
+        mode, origin, origin_geo.lat, origin_geo.lon,
+        destination, dest_geo.lat, dest_geo.lon,
+    )
+
+    # ── Step 2: Generate ONLY the requested mode's route ─────────────────
+    route_start = _time.time()
+    route_generators = {
+        "air":  lambda: generate_air_route(origin_geo, dest_geo),
+        "sea":  lambda: generate_sea_route(origin_geo, dest_geo),
+        "road": lambda: generate_road_route(origin_geo, dest_geo),
+    }
+
+    route_result = None
+    try:
+        gen_fn = route_generators[mode]
+        route_result = await asyncio.to_thread(
+            lambda: get_or_generate_route(mode, origin_geo, dest_geo, gen_fn)
+        )
+        logger.info(
+            "[%s] route: %d waypoints, %.0f km",
+            mode, len(route_result.waypoints), route_result.total_distance_km,
+        )
+    except Exception as exc:
+        logger.warning("[%s] route generation failed: %s", mode, exc)
+    timings["route_generation_ms"] = round((_time.time() - route_start) * 1000, 1)
+
+    # ── Step 3: Analyze the single mode ──────────────────────────────────
+    def _risk_band(score: float) -> str:
+        if score < 0.25: return "LOW"
+        if score < 0.50: return "MEDIUM"
+        if score < 0.75: return "HIGH"
+        return "CRITICAL"
+
+    mode_result: dict[str, Any]
+
+    if route_result is None:
+        mode_result = {
+            "status": "UNKNOWN",
+            "alerts": 0,
+            "risk_score": None,
+            "safety_score": None,
+            "message": f"{mode.capitalize()} route could not be computed",
+            "distance_km": None,
+            "zone_intersections": [],
+            "events": [],
+        }
+        timings["db_query_ms"] = 0
+        timings["zone_intersection_ms"] = 0
+        timings["risk_aggregation_ms"] = 0
+    else:
+        try:
+            # Zone intersection
+            zone_start = _time.time()
+            zone_intersections = check_route_zone_intersections(
+                route_result.waypoints, transport_mode=mode
+            )
+            zone_risk = compute_zone_risk(zone_intersections)
+            timings["zone_intersection_ms"] = round((_time.time() - zone_start) * 1000, 1)
+
+            # DB query
+            db_start = _time.time()
+            enriched_events, distances_km = await get_events_near_route(
+                route=route_result.waypoints,
+                collection=mongo_collection,
+                radius_km=radius_km,
+                min_label_confidence=min_confidence,
+            )
+            timings["db_query_ms"] = round((_time.time() - db_start) * 1000, 1)
+
+            # Filter out seed events
+            enriched_events = [e for e in enriched_events if getattr(e, "source", "") != "seed"]
+            distances_km = {eid: d for eid, d in distances_km.items()
+                           if any(e.event_id == eid for e in enriched_events)}
+
+            logger.info("[%s] %d real events, %d zone intersections, zone_risk=%.2f",
+                        mode, len(enriched_events), len(zone_intersections), zone_risk)
+
+            # Risk aggregation
+            agg_start = _time.time()
+            route_id = f"{origin}→{destination}[{mode}]"
+            risk_output = run(route_id, enriched_events, distances_km)
+            event_risk = risk_output.final_risk_score
+
+            # Combined risk (same formula as multi-mode v5)
+            if event_risk > 0 and zone_risk > 0:
+                final_risk = (event_risk * 0.70) + (zone_risk * 0.30)
+            elif event_risk > 0:
+                final_risk = event_risk
+            elif zone_risk > 0:
+                final_risk = zone_risk * 0.40
+            else:
+                final_risk = 0.0
+
+            # Source corroboration
+            if enriched_events:
+                unique_sources = set()
+                max_corroboration = 1
+                for e in enriched_events:
+                    publishers = getattr(e, "publishers", []) or []
+                    if publishers:
+                        unique_sources.update(publishers)
+                    else:
+                        src = getattr(e, 'source', '') or ''
+                        if src:
+                            unique_sources.add(src)
+                    max_corroboration = max(
+                        max_corroboration,
+                        int(getattr(e, "corroboration_count", 1) or 1),
+                    )
+                n_sources = len(unique_sources)
+                if n_sources >= 3 or max_corroboration >= 3:
+                    final_risk = min(final_risk * 1.15, 1.0)
+                elif n_sources <= 1 and len(enriched_events) <= 2:
+                    final_risk *= 0.90
+
+            final_risk = round(min(final_risk, 1.0), 4)
+            safety_score = round(1.0 - final_risk, 4)
+            risk_band = _risk_band(final_risk)
+            timings["risk_aggregation_ms"] = round((_time.time() - agg_start) * 1000, 1)
+
+            message = _generate_risk_message(len(enriched_events), final_risk, mode)
+            evidence = _build_evidence_payload(enriched_events, distances_km, limit=5)
+
+            mode_result = {
+                "status":             risk_band,
+                "alerts":             len(enriched_events),
+                "risk_score":         final_risk,
+                "safety_score":       safety_score,
+                "distance_km":        route_result.total_distance_km,
+                "message":            message,
+                "zone_risk":          round(zone_risk, 4),
+                "event_risk":         round(event_risk, 4),
+                "zone_intersections": zone_intersections,
+                "events":             evidence,
+            }
+
+        except Exception as exc:
+            logger.exception("[%s] analysis failed: %s", mode, exc)
+            mode_result = {
+                "status": "ERROR",
+                "alerts": 0,
+                "risk_score": None,
+                "message": f"Analysis failed: {exc}",
+                "distance_km": route_result.total_distance_km if route_result else None,
+                "zone_intersections": [],
+                "events": [],
+            }
+
+    timings["total_ms"] = round((_time.time() - total_start) * 1000, 1)
+
+    # Determine recommendation (single-mode always recommends itself)
+    recommended = mode if mode_result.get("safety_score") is not None else "air"
+
+    return {
+        "origin":             origin_geo.display_name,
+        "destination":        dest_geo.display_name,
+        "recommended_mode":   recommended,
+        "modes":              {mode: mode_result},
+        "analyzed_at":        datetime.now(timezone.utc).isoformat(),
+        "timings":            timings,
+    }
